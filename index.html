@@ -2,14 +2,12 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no, maximum-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
     <title>PDF Highlighter</title>
     <link rel="manifest" href="manifest.json">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: sans-serif; background: #333; color: white; display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
-        
-        /* Toolbar – fully responsive */
         #toolbar {
             background: #222; padding: 6px; display: flex; flex-wrap: wrap;
             align-items: center; gap: 6px; position: fixed; top: 0; width: 100%; z-index: 10;
@@ -22,21 +20,17 @@
         #toolbar button:disabled { opacity: 0.4; }
         #fileInput { width: auto; min-width: 80px; background: #555; }
         #toolbar span { font-size: 12px; color: #aaa; white-space: nowrap; }
-        
-        /* Page container – enables custom pinch zoom */
         #page-container {
             margin-top: 60px; flex: 1; overflow: auto; display: flex;
             justify-content: center; padding: 10px; background: #525659;
-            touch-action: none;  /* we handle gestures ourselves */
+            touch-action: none;  /* we handle gestures */
             position: relative;
         }
-        
         .page-wrapper {
             position: relative; margin-bottom: 10px;
             transform-origin: 0 0;
         }
         canvas { display: block; }
-        
         .textLayer {
             position: absolute; left: 0; top: 0; right: 0; bottom: 0;
             overflow: hidden; opacity: 0.25; line-height: 1.0; color: transparent;
@@ -46,8 +40,6 @@
             cursor: text; transform-origin: 0% 0%;
         }
         .textLayer ::selection { background: rgba(0,0,255,0.3); }
-        
-        /* Adjust on small screens */
         @media (max-width: 400px) {
             #toolbar button { font-size: 11px; padding: 5px 6px; }
             #toolbar span { font-size: 11px; }
@@ -65,22 +57,20 @@
         <button id="removeBtn" disabled>Undo</button>
         <button id="zoomOutBtn" disabled>− Zoom</button>
         <button id="zoomInBtn" disabled>+ Zoom</button>
-        <span> | Scale: <span id="zoomLevel">1.5</span>x</span>
+        <span>Scale: <span id="zoomLevel">1.5</span>x</span>
         <span style="font-size:11px; color:#aaa;">(Tap highlight to delete)</span>
     </div>
-
     <div id="page-container">
         <div class="page-wrapper" id="pageWrapper">
             <canvas id="pdfCanvas"></canvas>
             <div id="textLayer" class="textLayer"></div>
         </div>
     </div>
-
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <script>
         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-        // DOM elements
+        // DOM
         const fileInput = document.getElementById('fileInput');
         const prevBtn = document.getElementById('prevBtn');
         const nextBtn = document.getElementById('nextBtn');
@@ -96,15 +86,22 @@
         const pageContainer = document.getElementById('page-container');
         const ctx = canvas.getContext('2d');
 
+        // ----- Config -----
         let pdfDoc = null;
         let currentPage = 1;
         let totalPages = 0;
-        let scale = 1.5;
+        let scale = 1.5;                 // logical zoom level
         const MIN_SCALE = 0.5;
         const MAX_SCALE = 3.0;
         let highlights = {};
 
-        // ---------- Zoom via buttons ----------
+        // High quality: render at device pixel ratio
+        const dpr = window.devicePixelRatio || 1;
+
+        // Speed cache: store rendered pages as ImageData
+        const pageCache = new Map();     // pageNum -> ImageData (snapshot of canvas)
+
+        // ----- Zoom helpers -----
         function updateZoomDisplay() {
             zoomLevelSpan.textContent = scale.toFixed(1);
             zoomOutBtn.disabled = (scale <= MIN_SCALE || !pdfDoc);
@@ -116,7 +113,10 @@
             if (newScale > MAX_SCALE) newScale = MAX_SCALE;
             if (newScale !== scale) {
                 scale = newScale;
-                if (pdfDoc) renderPage(currentPage);
+                if (pdfDoc) {
+                    pageCache.delete(currentPage); // clear cached version because scale changed
+                    renderPage(currentPage);
+                }
             }
             updateZoomDisplay();
         }
@@ -124,41 +124,47 @@
         zoomInBtn.addEventListener('click', () => setScale(scale + 0.25));
         zoomOutBtn.addEventListener('click', () => setScale(scale - 0.25));
 
-        // ---------- Pinch-to-zoom that stays centred ----------
-        let lastDist = 0;
-        let lastScale = scale;
-        let lastMidX = 0, lastMidY = 0;   // midpoint relative to the page-wrapper
+        // ----- Custom pinch-to-zoom anywhere -----
+        let pinchStartDist = 0;
+        let pinchStartScale = scale;
+        let pinchOriginX = 0, pinchOriginY = 0;     // relative to pageWrapper
+
+        function getTouchDist(touches) {
+            const dx = touches[0].clientX - touches[1].clientX;
+            const dy = touches[0].clientY - touches[1].clientY;
+            return Math.sqrt(dx * dx + dy * dy);
+        }
+
+        function getTouchMid(touches) {
+            return {
+                x: (touches[0].clientX + touches[1].clientX) / 2,
+                y: (touches[0].clientY + touches[1].clientY) / 2
+            };
+        }
 
         pageContainer.addEventListener('touchstart', (e) => {
             if (e.touches.length === 2) {
-                const dx = e.touches[0].clientX - e.touches[1].clientX;
-                const dy = e.touches[0].clientY - e.touches[1].clientY;
-                lastDist = Math.sqrt(dx*dx + dy*dy);
-                lastScale = scale;
-                // Calculate midpoint of the two fingers relative to the page-wrapper
-                const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
-                const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+                pinchStartDist = getTouchDist(e.touches);
+                pinchStartScale = scale;
+                const mid = getTouchMid(e.touches);
                 const wrapperRect = pageWrapper.getBoundingClientRect();
-                lastMidX = midX - wrapperRect.left;
-                lastMidY = midY - wrapperRect.top;
+                pinchOriginX = mid.x - wrapperRect.left;
+                pinchOriginY = mid.y - wrapperRect.top;
                 e.preventDefault();
             }
         }, { passive: false });
 
         pageContainer.addEventListener('touchmove', (e) => {
-            if (e.touches.length === 2 && lastDist > 0) {
-                const dx = e.touches[0].clientX - e.touches[1].clientX;
-                const dy = e.touches[0].clientY - e.touches[1].clientY;
-                const newDist = Math.sqrt(dx*dx + dy*dy);
-                const factor = newDist / lastDist;
-                let newScale = lastScale * factor;
+            if (e.touches.length === 2 && pinchStartDist > 0) {
+                const newDist = getTouchDist(e.touches);
+                const factor = newDist / pinchStartDist;
+                let newScale = pinchStartScale * factor;
                 newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, newScale));
-                
-                // Apply visual zoom with correct origin
-                pageWrapper.style.transformOrigin = `${lastMidX}px ${lastMidY}px`;
+
+                // Apply visual transform anchored on pinch origin
+                pageWrapper.style.transformOrigin = `${pinchOriginX}px ${pinchOriginY}px`;
                 pageWrapper.style.transform = `scale(${newScale})`;
-                
-                // Update displayed scale
+
                 zoomLevelSpan.textContent = newScale.toFixed(1);
                 scale = newScale;
                 updateZoomDisplay();
@@ -167,26 +173,36 @@
         }, { passive: false });
 
         pageContainer.addEventListener('touchend', (e) => {
-            if (lastDist > 0) {
-                // Finalise: remove transform and re-render at the new scale
+            if (pinchStartDist > 0) {
+                // Finalise: re-render at the new scale precisely, remove transform
                 pageWrapper.style.transform = '';
                 pageWrapper.style.transformOrigin = '0 0';
-                if (pdfDoc) renderPage(currentPage);
-                lastDist = 0;
+                if (pdfDoc) {
+                    pageCache.delete(currentPage);
+                    renderPage(currentPage);
+                }
+                pinchStartDist = 0;
             }
         });
 
-        // ---------- PDF rendering ----------
+        // ----- PDF loading with speed options -----
         function loadPdf(file) {
             const reader = new FileReader();
             reader.onload = function(e) {
                 const typedArray = new Uint8Array(e.target.result);
-                pdfjsLib.getDocument(typedArray).promise
+                // Optimised loading options
+                const loadingTask = pdfjsLib.getDocument({
+                    data: typedArray,
+                    disableAutoFetch: false,  // pre‑fetch pages for speed
+                    disableStream: false      // use streaming
+                });
+                loadingTask.promise
                 .then(pdf => {
                     pdfDoc = pdf;
                     totalPages = pdf.numPages;
                     currentPage = 1;
                     highlights = {};
+                    pageCache.clear();
                     renderPage(currentPage);
                 })
                 .catch(err => alert('Error loading PDF: ' + err.message));
@@ -194,38 +210,120 @@
             reader.readAsArrayBuffer(file);
         }
 
+        // ----- Page rendering with high quality + caching -----
         async function renderPage(pageNum) {
             if (!pdfDoc) return;
+
             const page = await pdfDoc.getPage(pageNum);
-            const viewport = page.getViewport({ scale });
-            canvas.width = viewport.width;
-            canvas.height = viewport.height;
-            canvas.style.width = viewport.width + 'px';
-            canvas.style.height = viewport.height + 'px';
+            const logicalViewport = page.getViewport({ scale: scale });
+            // Use device pixel ratio for crispness
+            const renderScale = scale * dpr;
+            const renderViewport = page.getViewport({ scale: renderScale });
+
+            // Set canvas size to high-DPI dimensions
+            canvas.width = renderViewport.width;
+            canvas.height = renderViewport.height;
+            // Display size stays at logical size
+            canvas.style.width = logicalViewport.width + 'px';
+            canvas.style.height = logicalViewport.height + 'px';
+
+            // Set text layer to logical size
             textLayerDiv.innerHTML = '';
-            textLayerDiv.style.width = viewport.width + 'px';
-            textLayerDiv.style.height = viewport.height + 'px';
-            const renderContext = { canvasContext: ctx, viewport };
+            textLayerDiv.style.width = logicalViewport.width + 'px';
+            textLayerDiv.style.height = logicalViewport.height + 'px';
+
+            const renderContext = { canvasContext: ctx, viewport: renderViewport };
             await page.render(renderContext).promise;
+
+            // Build text layer using logical viewport
             const textContent = await page.getTextContent();
             await pdfjsLib.renderTextLayer({
                 textContentSource: textContent,
                 container: textLayerDiv,
-                viewport,
+                viewport: logicalViewport,
                 textDivs: []
             });
-            drawHighlights(pageNum);
+
+            // Store a copy of the canvas for instant navigation
+            const imgData = ctx.getImageData(0, 0, canvas.width, canvas.height);
+            pageCache.set(pageNum, imgData);
+
+            // Draw highlights (must be drawn at scale: they are saved in logical coords)
+            drawHighlights(pageNum, logicalViewport);
             updateUI();
+
+            // Preload adjacent pages in background (speed boost)
+            preloadAdjacent(pageNum);
         }
 
-        function drawHighlights(pageNum) {
+        function drawHighlights(pageNum, logicalViewport) {
             if (!highlights[pageNum]) return;
+            // Because we render at dpr, we must scale highlight coords
+            const factor = dpr;
+            ctx.save();
+            ctx.scale(factor, factor);  // draw highlights in logical coords but scaled to canvas
             highlights[pageNum].forEach(h => {
                 ctx.fillStyle = h.color || 'rgba(255,255,0,0.4)';
                 ctx.fillRect(h.x, h.y, h.w, h.h);
             });
+            ctx.restore();
         }
 
+        // ----- Instant navigation using cache -----
+        async function renderPageCached(pageNum) {
+            if (pageCache.has(pageNum)) {
+                // Restore from cache instantly
+                const imgData = pageCache.get(pageNum);
+                const logicalViewport = (await pdfDoc.getPage(pageNum)).getViewport({ scale });
+                canvas.width = imgData.width;
+                canvas.height = imgData.height;
+                canvas.style.width = logicalViewport.width + 'px';
+                canvas.style.height = logicalViewport.height + 'px';
+                ctx.putImageData(imgData, 0, 0);
+                // Rebuild text layer (fast, no re-render)
+                textLayerDiv.innerHTML = '';
+                textLayerDiv.style.width = logicalViewport.width + 'px';
+                textLayerDiv.style.height = logicalViewport.height + 'px';
+                const page = await pdfDoc.getPage(pageNum);
+                const textContent = await page.getTextContent();
+                await pdfjsLib.renderTextLayer({
+                    textContentSource: textContent,
+                    container: textLayerDiv,
+                    viewport: logicalViewport,
+                    textDivs: []
+                });
+                drawHighlights(pageNum, logicalViewport);
+                updateUI();
+                preloadAdjacent(pageNum);
+                return;
+            }
+            // Fallback to full render
+            await renderPage(pageNum);
+        }
+
+        // Preload next & previous pages if not cached
+        async function preloadAdjacent(pageNum) {
+            const pagesToPreload = [pageNum - 1, pageNum + 1].filter(p => p >= 1 && p <= totalPages && !pageCache.has(p));
+            for (let p of pagesToPreload) {
+                try {
+                    const page = await pdfDoc.getPage(p);
+                    const logicalViewport = page.getViewport({ scale });
+                    const renderScale = scale * dpr;
+                    const renderViewport = page.getViewport({ scale: renderScale });
+                    const offscreen = document.createElement('canvas');
+                    offscreen.width = renderViewport.width;
+                    offscreen.height = renderViewport.height;
+                    const offCtx = offscreen.getContext('2d');
+                    await page.render({ canvasContext: offCtx, viewport: renderViewport }).promise;
+                    const imgData = offCtx.getImageData(0, 0, offscreen.width, offscreen.height);
+                    pageCache.set(p, imgData);
+                } catch (e) {
+                    // ignore preload failures
+                }
+            }
+        }
+
+        // ----- Highlighting -----
         function addHighlightFromSelection() {
             const selection = window.getSelection();
             if (!selection.rangeCount) { alert('Select some text first.'); return; }
@@ -235,6 +333,7 @@
             const rects = range.getClientRects();
             for (let i = 0; i < rects.length; i++) {
                 let r = rects[i];
+                // Coordinates relative to canvas display (logical)
                 const x = r.left - canvasRect.left;
                 const y = r.top - canvasRect.top;
                 const w = r.width;
@@ -244,7 +343,9 @@
                 }
             }
             selection.removeAllRanges();
-            renderPage(currentPage);
+            // Re-render to show new highlight
+            pageCache.delete(currentPage);
+            renderPageCached(currentPage);
         }
 
         function removeLastHighlight() {
@@ -252,28 +353,30 @@
                 alert('No highlight on this page.'); return;
             }
             highlights[currentPage].pop();
-            renderPage(currentPage);
+            pageCache.delete(currentPage);
+            renderPageCached(currentPage);
         }
 
         function handleCanvasClick(e) {
             if (!highlights[currentPage]) return;
             const rect = canvas.getBoundingClientRect();
-            const scaleX = canvas.width / rect.width;
-            const scaleY = canvas.height / rect.height;
-            const mouseX = (e.clientX - rect.left) * scaleX;
-            const mouseY = (e.clientY - rect.top) * scaleY;
+            // Since canvas is displayed at logical size, click coords are in logical space
+            const mouseX = e.clientX - rect.left;
+            const mouseY = e.clientY - rect.top;
             const pageHighlights = highlights[currentPage];
             for (let i = pageHighlights.length - 1; i >= 0; i--) {
                 const h = pageHighlights[i];
                 if (mouseX >= h.x && mouseX <= h.x + h.w &&
                     mouseY >= h.y && mouseY <= h.y + h.h) {
                     pageHighlights.splice(i, 1);
-                    renderPage(currentPage);
+                    pageCache.delete(currentPage);
+                    renderPageCached(currentPage);
                     return;
                 }
             }
         }
 
+        // ----- UI & Navigation -----
         function updateUI() {
             if (!pdfDoc) {
                 pageInfo.textContent = '0 / 0';
@@ -295,10 +398,10 @@
             const newPage = currentPage + delta;
             if (newPage < 1 || newPage > totalPages) return;
             currentPage = newPage;
-            renderPage(currentPage);
+            renderPageCached(currentPage);
         }
 
-        // ---------- Event listeners ----------
+        // ----- Events -----
         fileInput.addEventListener('change', (e) => {
             if (e.target.files.length > 0) loadPdf(e.target.files[0]);
         });
@@ -307,7 +410,8 @@
         highlightBtn.addEventListener('click', addHighlightFromSelection);
         removeBtn.addEventListener('click', removeLastHighlight);
         canvas.addEventListener('click', handleCanvasClick);
+
         updateUI();
     </script>
 </body>
-</html>
+    </html>
