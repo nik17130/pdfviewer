@@ -4,6 +4,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
     <title>PDF Highlighter</title>
+    <link rel="manifest" href="manifest.json">
     <style>
         * { box-sizing: border-box; margin: 0; padding: 0; }
         body { font-family: sans-serif; background: #333; color: white; display: flex; flex-direction: column; height: 100vh; }
@@ -35,6 +36,9 @@
         <button id="prevBtn" disabled>◀ Prev</button>
         <span id="pageInfo">Page 0 / 0</span>
         <button id="nextBtn" disabled>Next ▶</button>
+        <button id="zoomOutBtn" disabled>− Zoom</button>
+        <button id="zoomInBtn" disabled>Zoom +</button>
+        <span style="font-size:12px; color:#aaa;">Scale: <span id="zoomLevel">1.5</span>x</span>
         <button id="highlightBtn" disabled>Highlight Selected</button>
         <button id="removeBtn" disabled>Remove Last Highlight</button>
         <span style="font-size:12px; color:#aaa;">(Tap a highlight to remove it)</span>
@@ -46,7 +50,6 @@
         </div>
     </div>
 
-    <!-- Load PDF.js from CDN – no local files needed -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
     <script>
         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
@@ -54,6 +57,9 @@
         const fileInput = document.getElementById('fileInput');
         const prevBtn = document.getElementById('prevBtn');
         const nextBtn = document.getElementById('nextBtn');
+        const zoomOutBtn = document.getElementById('zoomOutBtn');
+        const zoomInBtn = document.getElementById('zoomInBtn');
+        const zoomLevelSpan = document.getElementById('zoomLevel');
         const pageInfo = document.getElementById('pageInfo');
         const highlightBtn = document.getElementById('highlightBtn');
         const removeBtn = document.getElementById('removeBtn');
@@ -65,7 +71,31 @@
         let currentPage = 1;
         let totalPages = 0;
         let scale = 1.5;
-        let highlights = {};   // { pageNum: [ {x,y,w,h,color} ] }
+        const MIN_SCALE = 0.5;
+        const MAX_SCALE = 3.0;
+        let highlights = {};
+
+        function updateZoomButtons() {
+            zoomOutBtn.disabled = (scale <= MIN_SCALE || !pdfDoc);
+            zoomInBtn.disabled = (scale >= MAX_SCALE || !pdfDoc);
+            zoomLevelSpan.textContent = scale.toFixed(1);
+        }
+
+        function zoomIn() {
+            if (scale < MAX_SCALE) {
+                scale = Math.min(MAX_SCALE, scale + 0.25);
+                updateZoomButtons();
+                if (pdfDoc) renderPage(currentPage);
+            }
+        }
+
+        function zoomOut() {
+            if (scale > MIN_SCALE) {
+                scale = Math.max(MIN_SCALE, scale - 0.25);
+                updateZoomButtons();
+                if (pdfDoc) renderPage(currentPage);
+            }
+        }
 
         function loadPdf(file) {
             const reader = new FileReader();
@@ -78,7 +108,6 @@
                     currentPage = 1;
                     highlights = {};
                     renderPage(currentPage);
-                    updateUI();
                 })
                 .catch(err => alert('Error loading PDF: ' + err.message));
             };
@@ -100,6 +129,110 @@
             await page.render(renderContext).promise;
             const textContent = await page.getTextContent();
             await pdfjsLib.renderTextLayer({
+                textContentSource: textContent,
+                container: textLayerDiv,
+                viewport,
+                textDivs: []
+            });
+            drawHighlights(pageNum);
+            updateUI();
+        }
+
+        function drawHighlights(pageNum) {
+            if (!highlights[pageNum]) return;
+            highlights[pageNum].forEach(h => {
+                ctx.fillStyle = h.color || 'rgba(255,255,0,0.4)';
+                ctx.fillRect(h.x, h.y, h.w, h.h);
+            });
+        }
+
+        function addHighlightFromSelection() {
+            const selection = window.getSelection();
+            if (!selection.rangeCount) { alert('Please select some text first.'); return; }
+            const range = selection.getRangeAt(0);
+            const canvasRect = canvas.getBoundingClientRect();
+            if (!highlights[currentPage]) highlights[currentPage] = [];
+            const rects = range.getClientRects();
+            for (let i = 0; i < rects.length; i++) {
+                let r = rects[i];
+                const x = r.left - canvasRect.left;
+                const y = r.top - canvasRect.top;
+                const w = r.width;
+                const h = r.height;
+                if (w > 0 && h > 0) {
+                    highlights[currentPage].push({ x, y, w, h, color: 'rgba(255,255,0,0.4)' });
+                }
+            }
+            selection.removeAllRanges();
+            renderPage(currentPage);
+        }
+
+        function removeLastHighlight() {
+            if (!highlights[currentPage] || highlights[currentPage].length === 0) {
+                alert('No highlight on this page.'); return;
+            }
+            highlights[currentPage].pop();
+            renderPage(currentPage);
+        }
+
+        function handleCanvasClick(e) {
+            if (!highlights[currentPage]) return;
+            const rect = canvas.getBoundingClientRect();
+            const scaleX = canvas.width / rect.width;
+            const scaleY = canvas.height / rect.height;
+            const mouseX = (e.clientX - rect.left) * scaleX;
+            const mouseY = (e.clientY - rect.top) * scaleY;
+            const pageHighlights = highlights[currentPage];
+            for (let i = pageHighlights.length - 1; i >= 0; i--) {
+                const h = pageHighlights[i];
+                if (mouseX >= h.x && mouseX <= h.x + h.w &&
+                    mouseY >= h.y && mouseY <= h.y + h.h) {
+                    pageHighlights.splice(i, 1);
+                    renderPage(currentPage);
+                    return;
+                }
+            }
+        }
+
+        function updateUI() {
+            if (!pdfDoc) {
+                pageInfo.textContent = 'Page 0 / 0';
+                prevBtn.disabled = true;
+                nextBtn.disabled = true;
+                highlightBtn.disabled = true;
+                removeBtn.disabled = true;
+                updateZoomButtons();
+                return;
+            }
+            pageInfo.textContent = `Page ${currentPage} / ${totalPages}`;
+            prevBtn.disabled = (currentPage <= 1);
+            nextBtn.disabled = (currentPage >= totalPages);
+            highlightBtn.disabled = false;
+            removeBtn.disabled = false;
+            updateZoomButtons();
+        }
+
+        function goToPage(delta) {
+            const newPage = currentPage + delta;
+            if (newPage < 1 || newPage > totalPages) return;
+            currentPage = newPage;
+            renderPage(currentPage);
+        }
+
+        fileInput.addEventListener('change', (e) => {
+            if (e.target.files.length > 0) loadPdf(e.target.files[0]);
+        });
+        prevBtn.addEventListener('click', () => goToPage(-1));
+        nextBtn.addEventListener('click', () => goToPage(1));
+        zoomInBtn.addEventListener('click', zoomIn);
+        zoomOutBtn.addEventListener('click', zoomOut);
+        highlightBtn.addEventListener('click', addHighlightFromSelection);
+        removeBtn.addEventListener('click', removeLastHighlight);
+        canvas.addEventListener('click', handleCanvasClick);
+        updateUI();
+    </script>
+</body>
+</html>            await pdfjsLib.renderTextLayer({
                 textContentSource: textContent,
                 container: textLayerDiv,
                 viewport,
