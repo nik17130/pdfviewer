@@ -6,9 +6,9 @@
     <title>PDF Highlighter</title>
     <link rel="manifest" href="manifest.json">
     <style>
-        * { box-sizing: border-box; margin:0; padding:0; }
+        * { box-sizing:border-box; margin:0; padding:0; }
         body {
-            font-family: sans-serif; background:#333; color:#fff;
+            font-family:sans-serif; background:#333; color:#fff;
             display:flex; flex-direction:column; height:100vh;
             overflow:hidden; touch-action:none;
         }
@@ -30,17 +30,16 @@
             overflow:hidden; position:relative;
             display:flex; justify-content:center; align-items:flex-start;
         }
-        .page-wrapper {
-            position:absolute; top:0; left:50%;  /* centered horizontally */
-            transform-origin:0 0;
-            will-change:transform;   /* hardware‑accelerated */
+        .canvas-wrapper {
+            position:absolute; top:0; left:50%;  /* will be shifted by JS */
         }
         canvas { display:block; }
         .textLayer {
             position:absolute; left:0; top:0; width:100%; height:100%;
             overflow:hidden; opacity:0.25; line-height:1.0; color:transparent;
-            pointer-events:auto;
+            pointer-events:none;  /* we'll enable only when not panning */
         }
+        .textLayer.allow-select { pointer-events:auto; }
         .textLayer span {
             color:transparent; position:absolute; white-space:pre;
             cursor:text; transform-origin:0% 0%;
@@ -69,7 +68,7 @@
     </div>
 
     <div id="page-container">
-        <div class="page-wrapper" id="pageWrapper">
+        <div class="canvas-wrapper" id="canvasWrapper">
             <canvas id="pdfCanvas"></canvas>
             <div id="textLayer" class="textLayer"></div>
         </div>
@@ -79,7 +78,7 @@
     <script>
         pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
 
-        // ─── DOM elements ───
+        // ─── DOM refs ───
         const fileInput = document.getElementById('fileInput');
         const prevBtn = document.getElementById('prevBtn');
         const nextBtn = document.getElementById('nextBtn');
@@ -90,329 +89,361 @@
         const highlightBtn = document.getElementById('highlightBtn');
         const removeBtn = document.getElementById('removeBtn');
         const canvas = document.getElementById('pdfCanvas');
-        const textLayerDiv = document.getElementById('textLayer');
-        const pageWrapper = document.getElementById('pageWrapper');
+        const textLayer = document.getElementById('textLayer');
+        const canvasWrapper = document.getElementById('canvasWrapper');
         const pageContainer = document.getElementById('page-container');
         const ctx = canvas.getContext('2d');
 
         const dpr = window.devicePixelRatio || 1;
         const MIN_SCALE = 0.5;
         const MAX_SCALE = 3.0;
-        const RENDER_UPSCALE = 2.0;   // render at 2x the maximum zoom for crispness
 
+        // High‑res bitmap (offscreen canvas) for the current page
+        let hiResBitmap = null;           // ImageBitmap (GPU‑friendly)
+        let pageNaturalWidth = 0, pageNaturalHeight = 0;   // at scale=1 (points)
+
+        // View state
+        let viewScale = 1.5;              // current zoom
+        let viewOffsetX = 0, viewOffsetY = 0;   // top-left of visible area in content pixels (at viewScale)
+
+        // Highlight storage (in PDF points)
+        let highlights = {};
+
+        // PDF doc
         let pdfDoc = null;
         let currentPage = 1;
         let totalPages = 0;
-        let pageNaturalSize = { width: 0, height: 0 };   // PDF points
 
-        // State
-        let currentScale = 1.5;          // logical zoom level
-        let baseOffsetX = 0, baseOffsetY = 0;   // pan offset (px) after last commit
-        let viewTransform = { scale: currentScale, x: 0, y: 0 };   // live transform
+        // Interaction flags
+        let isPanning = false;
+        let isPinching = false;
 
-        // Highlights in point space (same as PDF coordinates)
-        let highlights = {};
-
-        // Cached high‑res bitmap for current page
-        let cachedBitmap = null;
-
-        // ─── Apply CSS transform smoothly ───
-        function applyTransform() {
-            const { scale, x, y } = viewTransform;
-            pageWrapper.style.transform = `translate(${x}px, ${y}px) scale(${scale})`;
-        }
-
-        // ─── Commit current zoom/pan: re‑render at exact scale, reset transform to identity ───
-        async function commitView() {
-            // Set baseOffset to current pan position
-            baseOffsetX = viewTransform.x;
-            baseOffsetY = viewTransform.y;
-            currentScale = viewTransform.scale;
-
-            // Re‑render the page at this scale (will be sharp)
-            await renderPageAtExactScale(currentPage, currentScale);
-
-            // Reset transform to identity (since we've baked the scale into the canvas)
-            viewTransform = { scale: 1, x: 0, y: 0 };
-            applyTransform();
-
-            // Center the page horizontally (the wrapper will be positioned)
-            updatePagePosition();
-            updateUI();
-        }
-
-        // ─── Render page at a given scale (sharp, used after commit) ───
-        async function renderPageAtExactScale(pageNum, scale) {
-            if (!pdfDoc) return;
+        // ─── Utility: render page to high‑res bitmap (only when changing page) ───
+        async function generateHiResBitmap(pageNum) {
             const page = await pdfDoc.getPage(pageNum);
-            pageNaturalSize = { width: page.getViewport({ scale:1 }).width, height: page.getViewport({ scale:1 }).height };
+            const vp = page.getViewport({ scale: 1 });
+            pageNaturalWidth = vp.width;
+            pageNaturalHeight = vp.height;
 
-            const renderScale = scale * dpr;
+            // Render at 3 × dpr × MAX_SCALE? Actually render at a fixed high resolution: 3 * MAX_SCALE * dpr? Let's use 3 * MAX_SCALE = 9, multiplied by dpr? That's huge. We'll use a reasonable high res: base = 2 * dpr * MAX_SCALE? 
+            // For good quality at max zoom 3x, we need at least 3 * dpr pixels per point.
+            // Let's render at scale = MAX_SCALE * dpr * 2 (i.e., 6 * dpr). Actually just MAX_SCALE * dpr is enough if we never zoom in more, but to have margin, use MAX_SCALE * dpr * 2.
+            const renderScale = MAX_SCALE * dpr * 2;   // 6 * dpr, plenty even for slight over-zoom
             const viewport = page.getViewport({ scale: renderScale });
 
-            // Resize canvas
-            canvas.width = viewport.width;
-            canvas.height = viewport.height;
-            canvas.style.width = (viewport.width / dpr) + 'px';
-            canvas.style.height = (viewport.height / dpr) + 'px';
+            const offCanvas = document.createElement('canvas');
+            offCanvas.width = viewport.width;
+            offCanvas.height = viewport.height;
+            const offCtx = offCanvas.getContext('2d');
+            await page.render({ canvasContext: offCtx, viewport }).promise;
 
-            // Clear and render
+            // Convert to ImageBitmap for ultra‑fast drawing
+            hiResBitmap = await createImageBitmap(offCanvas);
+        }
+
+        // ─── Draw the visible area from hiResBitmap onto the visible canvas ───
+        function drawVisibleArea() {
+            if (!hiResBitmap) return;
+
+            // The hi‑res bitmap covers the full page at scale = MAX_SCALE * dpr * 2
+            const hiResScale = MAX_SCALE * dpr * 2; // points to hiRes pixels
+            const hiResWidth = pageNaturalWidth * hiResScale;
+            const hiResHeight = pageNaturalHeight * hiResScale;
+
+            // The content size (in screen pixels) at current viewScale: pageNatural * viewScale * dpr? No, viewScale is logical scale relative to points, and we want to draw on canvas at device pixel ratio:
+            // We'll set canvas size to match the visible container size? Actually we want to fill the container and then scroll around a virtual content.
+            // We'll make the canvas as large as the container (or we'll size the canvasWrapper to be the full content size and use CSS transform? No, we want to avoid transforms for simplicity.
+            // Instead, we'll set the canvas size to be the container's dimensions, and we'll draw the appropriate portion of hiResBitmap onto it.
+            
+            const containerWidth = pageContainer.clientWidth;
+            const containerHeight = pageContainer.clientHeight;
+
+            // Canvas will be exactly container size (in CSS pixels), but we need to account for DPR:
+            canvas.width = containerWidth * dpr;
+            canvas.height = containerHeight * dpr;
+            canvas.style.width = containerWidth + 'px';
+            canvas.style.height = containerHeight + 'px';
+
+            // The region of the high‑res bitmap to draw: we need to map viewOffsetX, viewOffsetY (which are in content pixels at viewScale) to hiRes coordinates.
+            // Conversion: content pixel to point: pointX = viewOffsetX / viewScale
+            // point to hiRes pixel: hiResX = pointX * hiResScale
+            const sx = (viewOffsetX / viewScale) * hiResScale;
+            const sy = (viewOffsetY / viewScale) * hiResScale;
+            const sw = (containerWidth / viewScale) * hiResScale;
+            const sh = (containerHeight / viewScale) * hiResScale;
+
+            // Draw the sub-rectangle of hiResBitmap onto the entire canvas
             ctx.clearRect(0, 0, canvas.width, canvas.height);
-            await page.render({ canvasContext: ctx, viewport }).promise;
-
-            // Build text layer at logical size
-            await buildTextLayer(pageNum, scale);
-
-            // Draw highlights (they are in point coords)
-            drawHighlights(pageNum, scale);
-
-            // Update page natural size for future panning limits etc.
-            cachedBitmap = null;   // we'll re‑render next time anyway
+            ctx.drawImage(hiResBitmap, sx, sy, sw, sh, 0, 0, canvas.width, canvas.height);
         }
 
-        // ─── Build text layer for the current scale ───
-        async function buildTextLayer(pageNum, scale) {
-            textLayerDiv.innerHTML = '';
-            const page = await pdfDoc.getPage(pageNum);
-            const viewport = page.getViewport({ scale });   // logical size
-            textLayerDiv.style.width = viewport.width + 'px';
-            textLayerDiv.style.height = viewport.height + 'px';
-            const textContent = await page.getTextContent();
-            await pdfjsLib.renderTextLayer({
-                textContentSource: textContent,
-                container: textLayerDiv,
-                viewport,
-                textDivs: []
-            });
-        }
-
-        // ─── Draw highlights on canvas (point coords) ───
-        function drawHighlights(pageNum, scale) {
-            if (!highlights[pageNum]) return;
-            const factor = scale * dpr;
+        // ─── Draw highlights on top of the canvas (after drawVisibleArea) ───
+        function drawHighlightsOverlay() {
+            if (!highlights[currentPage] || !pageNaturalWidth) return;
+            const containerWidth = pageContainer.clientWidth;
+            const containerHeight = pageContainer.clientHeight;
+            // We need to map highlights (in points) to canvas coordinates for the current view.
+            const scale = viewScale * dpr;   // points -> canvas pixels? No, highlight coordinates are in points. The canvas size is containerWidth*dpr, and it shows viewOffsetX..viewOffsetX+containerWidth in content pixels at viewScale.
+            // To draw a point (px, py) with width pw, height ph:
+            // Canvas position = ((pointX * viewScale) - viewOffsetX) * dpr
+            // Canvas size = (pointW * viewScale * dpr)
             ctx.save();
-            highlights[pageNum].forEach(h => {
+            highlights[currentPage].forEach(h => {
+                const x = (h.x * viewScale - viewOffsetX) * dpr;
+                const y = (h.y * viewScale - viewOffsetY) * dpr;
+                const w = h.w * viewScale * dpr;
+                const hh = h.h * viewScale * dpr;
                 ctx.fillStyle = h.color || 'rgba(255,255,0,0.4)';
-                ctx.fillRect(h.x * factor, h.y * factor, h.w * factor, h.h * factor);
+                ctx.fillRect(x, y, w, hh);
             });
             ctx.restore();
         }
 
-        // ─── Position the wrapper after commit (center horizontally) ───
-        function updatePagePosition() {
-            const containerWidth = pageContainer.clientWidth;
-            const canvasDisplayWidth = parseFloat(canvas.style.width) || (canvas.width / dpr);
-            // Center horizontally: left = (containerWidth - canvasDisplayWidth) / 2
-            const left = Math.max(0, (containerWidth - canvasDisplayWidth) / 2);
-            pageWrapper.style.left = left + 'px';
-            pageWrapper.style.top = baseOffsetY + 'px';   // keep vertical offset from panning
+        // ─── Redraw everything (call on every frame) ───
+        function redraw() {
+            drawVisibleArea();
+            drawHighlightsOverlay();
         }
 
-        // ─── Navigate to page ───
+        // ─── Position the text layer correctly (over canvas, for selection) ───
+        function updateTextLayer() {
+            if (!pdfDoc) return;
+            // The text layer should be positioned over the canvas and match its dimensions.
+            // Since canvas is exactly container size, text layer also sized to container.
+            const containerWidth = pageContainer.clientWidth;
+            const containerHeight = pageContainer.clientHeight;
+            textLayer.style.width = containerWidth + 'px';
+            textLayer.style.height = containerHeight + 'px';
+            // We'll need to rebuild the text content for the visible area? That's heavy. Better: only enable selection when view is static.
+            // We'll rebuild text layer on demand for the visible area, but that's complex. Instead, we'll set text layer to the full page content at current viewScale, but then pan/zoom will misalign. 
+            // Accept compromise: text selection works only when view is stable and we rebuild it for the visible region. For MuPDF-like behavior, we don't need selection during pan. So we only render text layer when not panning/pinching.
+        }
+
+        async function buildTextLayerForCurrentView() {
+            if (!pdfDoc) return;
+            // We'll rebuild the text layer covering the visible area at current viewScale.
+            const page = await pdfDoc.getPage(currentPage);
+            const viewport = page.getViewport({ scale: viewScale });
+            // Set text layer size to the full page size at this scale, but then we need to translate it to match viewOffset.
+            textLayer.style.width = viewport.width + 'px';
+            textLayer.style.height = viewport.height + 'px';
+            // Position it: left and top should be -viewOffsetX, -viewOffsetY (in CSS pixels, relative to the wrapper)
+            textLayer.style.left = (-viewOffsetX) + 'px';
+            textLayer.style.top = (-viewOffsetY) + 'px';
+            textLayer.innerHTML = '';
+            const textContent = await page.getTextContent();
+            await pdfjsLib.renderTextLayer({
+                textContentSource: textContent,
+                container: textLayer,
+                viewport,
+                textDivs: []
+            });
+            textLayer.classList.add('allow-select');
+        }
+
+        function clearTextLayer() {
+            textLayer.innerHTML = '';
+            textLayer.classList.remove('allow-select');
+        }
+
+        // ─── Pan & zoom operations (update offsets and scale) ───
+        function setView(scale, ox, oy) {
+            viewScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, scale));
+            // Clamp offsets so we don't scroll outside page
+            const contentW = pageNaturalWidth * viewScale;
+            const contentH = pageNaturalHeight * viewScale;
+            const cw = pageContainer.clientWidth;
+            const ch = pageContainer.clientHeight;
+            viewOffsetX = Math.min(Math.max(ox, 0), Math.max(0, contentW - cw));
+            viewOffsetY = Math.min(Math.max(oy, 0), Math.max(0, contentH - ch));
+            redraw();
+            updateTextLayerPosition();
+            zoomLevelSpan.textContent = viewScale.toFixed(1);
+            updateUIButtons();
+        }
+
+        function updateTextLayerPosition() {
+            // Adjust text layer position to match view (if built)
+            if (textLayer.classList.contains('allow-select')) {
+                textLayer.style.left = (-viewOffsetX) + 'px';
+                textLayer.style.top = (-viewOffsetY) + 'px';
+            }
+        }
+
+        function updateUIButtons() {
+            if (!pdfDoc) return;
+            prevBtn.disabled = currentPage <= 1;
+            nextBtn.disabled = currentPage >= totalPages;
+            zoomOutBtn.disabled = viewScale <= MIN_SCALE;
+            zoomInBtn.disabled = viewScale >= MAX_SCALE;
+            pageInfo.textContent = `${currentPage} / ${totalPages}`;
+        }
+
+        // ─── Go to page (resets view) ───
         async function goToPage(pageNum) {
             if (pageNum < 1 || pageNum > totalPages) return;
             currentPage = pageNum;
-            highlights[pageNum] = highlights[pageNum] || [];
-            // Reset view
-            currentScale = 1.5;
-            viewTransform = { scale: 1, x: 0, y: 0 };
-            baseOffsetX = 0;
-            baseOffsetY = 0;
-            await commitView();
+            viewScale = 1.5;
+            viewOffsetX = 0;
+            viewOffsetY = 0;
+            clearTextLayer();
+            await generateHiResBitmap(pageNum);
+            setView(viewScale, 0, 0);
+            // Preload adjacent
             preloadAdjacent(pageNum);
         }
 
-        // ─── Zoom buttons ───
-        async function setScale(newScale) {
-            newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, newScale));
-            currentScale = newScale;
-            viewTransform = { scale: 1, x: 0, y: 0 };
-            baseOffsetX = 0;
-            baseOffsetY = 0;
-            await commitView();
+        // ─── Preload adjacent pages hiRes in background ───
+        async function preloadAdjacent(pageNum) {
+            [pageNum - 1, pageNum + 1].forEach(async p => {
+                if (p >= 1 && p <= totalPages) {
+                    try {
+                        const page = await pdfDoc.getPage(p);
+                        const vp = page.getViewport({ scale: MAX_SCALE * dpr * 2 });
+                        const offCanvas = document.createElement('canvas');
+                        offCanvas.width = vp.width;
+                        offCanvas.height = vp.height;
+                        const offCtx = offCanvas.getContext('2d');
+                        await page.render({ canvasContext: offCtx, viewport: vp }).promise;
+                        // Just to warm up cache, we don't store
+                    } catch(e){}
+                }
+            });
         }
 
-        zoomInBtn.addEventListener('click', () => setScale(currentScale + 0.25));
-        zoomOutBtn.addEventListener('click', () => setScale(currentScale - 0.25));
+        // ─── Touch handling (pan and pinch) ───
+        let lastTouches = null;
+        let touchStartData = {};
 
-        // ─── Highlighting (point coords) ───
+        pageContainer.addEventListener('touchstart', e => {
+            e.preventDefault();
+            if (e.touches.length === 1) {
+                isPanning = true;
+                isPinching = false;
+                clearTextLayer();
+                touchStartData = {
+                    startX: e.touches[0].clientX,
+                    startY: e.touches[0].clientY,
+                    startOffsetX: viewOffsetX,
+                    startOffsetY: viewOffsetY
+                };
+            } else if (e.touches.length === 2) {
+                isPanning = false;
+                isPinching = true;
+                clearTextLayer();
+                const dx = e.touches[0].clientX - e.touches[1].clientX;
+                const dy = e.touches[0].clientY - e.touches[1].clientY;
+                const dist = Math.hypot(dx, dy);
+                const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+                const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+                // Convert mid point to content coordinates
+                const contentMidX = viewOffsetX + midX - pageContainer.getBoundingClientRect().left;
+                const contentMidY = viewOffsetY + midY - pageContainer.getBoundingClientRect().top;
+                touchStartData = {
+                    startDist: dist,
+                    startScale: viewScale,
+                    midContentX: contentMidX,
+                    midContentY: contentMidY,
+                    midScreenX: midX,
+                    midScreenY: midY
+                };
+            }
+        }, { passive: false });
+
+        pageContainer.addEventListener('touchmove', e => {
+            e.preventDefault();
+            if (isPanning && e.touches.length === 1) {
+                const dx = e.touches[0].clientX - touchStartData.startX;
+                const dy = e.touches[0].clientY - touchStartData.startY;
+                setView(viewScale, touchStartData.startOffsetX - dx, touchStartData.startOffsetY - dy);
+            } else if (isPinching && e.touches.length === 2) {
+                const dx = e.touches[0].clientX - e.touches[1].clientX;
+                const dy = e.touches[0].clientY - e.touches[1].clientY;
+                const dist = Math.hypot(dx, dy);
+                const scaleRatio = dist / touchStartData.startDist;
+                const newScale = touchStartData.startScale * scaleRatio;
+                // Calculate new offset to keep midContent point fixed on screen
+                const midX = (e.touches[0].clientX + e.touches[1].clientX) / 2;
+                const midY = (e.touches[0].clientY + e.touches[1].clientY) / 2;
+                const newContentMidX = touchStartData.midContentX * (newScale / touchStartData.startScale);
+                const newContentMidY = touchStartData.midContentY * (newScale / touchStartData.startScale);
+                const containerRect = pageContainer.getBoundingClientRect();
+                const newOffsetX = newContentMidX - (midX - containerRect.left);
+                const newOffsetY = newContentMidY - (midY - containerRect.top);
+                setView(newScale, newOffsetX, newOffsetY);
+            }
+        }, { passive: false });
+
+        pageContainer.addEventListener('touchend', async e => {
+            if (isPanning || isPinching) {
+                if (e.touches.length === 0) {
+                    isPanning = false;
+                    isPinching = false;
+                    // Rebuild text layer for selection after a short delay to avoid accidental selection
+                    setTimeout(() => {
+                        if (!isPanning && !isPinching) buildTextLayerForCurrentView();
+                    }, 200);
+                }
+            }
+        });
+
+        // ─── Highlighting (works with text selection after layer is built) ───
         async function addHighlightFromSelection() {
+            if (!textLayer.classList.contains('allow-select')) {
+                alert('Text selection only available when not panning.'); return;
+            }
             const selection = window.getSelection();
-            if (!selection.rangeCount) { alert('Select some text first.'); return; }
+            if (!selection.rangeCount) return;
             const range = selection.getRangeAt(0);
-            const canvasRect = canvas.getBoundingClientRect();
-            const scale = currentScale;
+            const page = await pdfDoc.getPage(currentPage);
+            const vp = page.getViewport({ scale: viewScale });
+            const textLayerRect = textLayer.getBoundingClientRect();
             if (!highlights[currentPage]) highlights[currentPage] = [];
             const rects = range.getClientRects();
             for (let i = 0; i < rects.length; i++) {
                 let r = rects[i];
-                // Convert from screen (canvas display) to point coordinates
-                const x = (r.left - canvasRect.left) / scale;
-                const y = (r.top - canvasRect.top) / scale;
-                const w = r.width / scale;
-                const h = r.height / scale;
+                // Convert from text layer screen coords to point coords
+                const x = (r.left - textLayerRect.left) / viewScale;
+                const y = (r.top - textLayerRect.top) / viewScale;
+                const w = r.width / viewScale;
+                const h = r.height / viewScale;
                 if (w > 0 && h > 0) {
                     highlights[currentPage].push({ x, y, w, h, color: 'rgba(255,255,0,0.4)' });
                 }
             }
             selection.removeAllRanges();
-            // Re‑draw highlights on canvas
-            await commitView();   // this re‑renders the page with highlights
+            redraw(); // highlights will be drawn on next redraw
         }
 
-        async function removeLastHighlight() {
+        function removeLastHighlight() {
             if (!highlights[currentPage] || highlights[currentPage].length === 0) {
                 alert('No highlight on this page.'); return;
             }
             highlights[currentPage].pop();
-            await commitView();
+            redraw();
         }
 
-        async function handleCanvasClick(e) {
+        // Tap to delete highlight (canvas click)
+        canvas.addEventListener('click', e => {
+            if (isPanning || isPinching) return;
             if (!highlights[currentPage]) return;
-            const canvasRect = canvas.getBoundingClientRect();
-            // Mouse in logical (display) coordinates
-            const mx = e.clientX - canvasRect.left;
-            const my = e.clientY - canvasRect.top;
-            const scale = currentScale;
-            // Convert to point space
-            const px = mx / scale;
-            const py = my / scale;
+            const rect = canvas.getBoundingClientRect();
+            const mx = e.clientX - rect.left;
+            const my = e.clientY - rect.top;
+            // Convert screen position to content coordinates
+            const pointX = (viewOffsetX + mx) / viewScale;
+            const pointY = (viewOffsetY + my) / viewScale;
             const pageHighlights = highlights[currentPage];
             for (let i = pageHighlights.length - 1; i >= 0; i--) {
                 const h = pageHighlights[i];
-                if (px >= h.x && px <= h.x + h.w && py >= h.y && py <= h.y + h.h) {
+                if (pointX >= h.x && pointX <= h.x + h.w &&
+                    pointY >= h.y && pointY <= h.y + h.h) {
                     pageHighlights.splice(i, 1);
-                    await commitView();
+                    redraw();
                     return;
                 }
             }
-        }
-
-        // ─── Touch handling for pan & pinch ───
-        let touchState = {
-            mode: 'idle',           // 'pan', 'pinch'
-            startX: 0, startY: 0,
-            startPanX: 0, startPanY: 0,   // pan offsets at touch start
-            pinchDistStart: 0,
-            pinchScaleStart: 1
-        };
-
-        function getTouchDist(touches) {
-            const dx = touches[0].clientX - touches[1].clientX;
-            const dy = touches[0].clientY - touches[1].clientY;
-            return Math.hypot(dx, dy);
-        }
-
-        pageContainer.addEventListener('touchstart', e => {
-            if (e.touches.length === 1) {
-                touchState.mode = 'pan';
-                touchState.startX = e.touches[0].clientX;
-                touchState.startY = e.touches[0].clientY;
-                touchState.startPanX = viewTransform.x;
-                touchState.startPanY = viewTransform.y;
-                e.preventDefault();
-            } else if (e.touches.length === 2) {
-                touchState.mode = 'pinch';
-                touchState.pinchDistStart = getTouchDist(e.touches);
-                touchState.pinchScaleStart = viewTransform.scale;
-                // Store midpoint reference for focal point
-                const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
-                const my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-                touchState.pinchMidX = mx;
-                touchState.pinchMidY = my;
-                e.preventDefault();
-            }
-        }, { passive: false });
-
-        pageContainer.addEventListener('touchmove', e => {
-            if (touchState.mode === 'pan' && e.touches.length === 1) {
-                const dx = e.touches[0].clientX - touchState.startX;
-                const dy = e.touches[0].clientY - touchState.startY;
-                viewTransform.x = touchState.startPanX + dx;
-                viewTransform.y = touchState.startPanY + dy;
-                applyTransform();
-                e.preventDefault();
-            } else if (touchState.mode === 'pinch' && e.touches.length === 2) {
-                const newDist = getTouchDist(e.touches);
-                const scaleChange = newDist / touchState.pinchDistStart;
-                let newScale = touchState.pinchScaleStart * scaleChange;
-                newScale = Math.min(MAX_SCALE, Math.max(MIN_SCALE, newScale));
-
-                // Adjust pan to keep the midpoint fixed
-                const mx = (e.touches[0].clientX + e.touches[1].clientX) / 2;
-                const my = (e.touches[0].clientY + e.touches[1].clientY) / 2;
-                const scaleRatio = newScale / viewTransform.scale;
-                viewTransform.x = mx - (touchState.pinchMidX - viewTransform.x) * scaleRatio;
-                viewTransform.y = my - (touchState.pinchMidY - viewTransform.y) * scaleRatio;
-                viewTransform.scale = newScale;
-
-                applyTransform();
-                // Update zoom display in real time
-                zoomLevelSpan.textContent = newScale.toFixed(1);
-                e.preventDefault();
-            }
-        }, { passive: false });
-
-        pageContainer.addEventListener('touchend', async e => {
-            if (touchState.mode === 'pinch') {
-                // Commit the final zoom level
-                currentScale = viewTransform.scale;
-                baseOffsetX = viewTransform.x;
-                baseOffsetY = viewTransform.y;
-                viewTransform = { scale: 1, x: 0, y: 0 };
-                await renderPageAtExactScale(currentPage, currentScale);
-                applyTransform();
-                updatePagePosition();
-                updateUI();
-            } else if (touchState.mode === 'pan') {
-                // Keep pan offset
-                baseOffsetX = viewTransform.x;
-                baseOffsetY = viewTransform.y;
-            }
-            touchState.mode = 'idle';
         });
-
-        // ─── UI update ───
-        function updateUI() {
-            if (!pdfDoc) {
-                pageInfo.textContent = '0 / 0';
-                prevBtn.disabled = true;
-                nextBtn.disabled = true;
-                highlightBtn.disabled = true;
-                removeBtn.disabled = true;
-                zoomLevelSpan.textContent = '1.5';
-            } else {
-                pageInfo.textContent = `${currentPage} / ${totalPages}`;
-                prevBtn.disabled = currentPage <= 1;
-                nextBtn.disabled = currentPage >= totalPages;
-                highlightBtn.disabled = false;
-                removeBtn.disabled = false;
-                zoomLevelSpan.textContent = currentScale.toFixed(1);
-                zoomOutBtn.disabled = currentScale <= MIN_SCALE;
-                zoomInBtn.disabled = currentScale >= MAX_SCALE;
-            }
-        }
-
-        // ─── Preload adjacent pages (optional caching) ───
-        async function preloadAdjacent(pageNum) {
-            // Simple caching: just store bitmap for next/prev
-            [pageNum - 1, pageNum + 1].forEach(async p => {
-                if (p >= 1 && p <= totalPages) {
-                    try {
-                        const page = await pdfDoc.getPage(p);
-                        const renderScale = 2 * dpr;
-                        const viewport = page.getViewport({ scale: renderScale });
-                        const offCanvas = document.createElement('canvas');
-                        offCanvas.width = viewport.width;
-                        offCanvas.height = viewport.height;
-                        const offCtx = offCanvas.getContext('2d');
-                        await page.render({ canvasContext: offCtx, viewport }).promise;
-                        // just warming up, keep it simple
-                    } catch(e) {}
-                }
-            });
-        }
 
         // ─── Load PDF ───
         function loadPdf(file) {
@@ -427,8 +458,8 @@
                     }).promise;
                     totalPages = pdfDoc.numPages;
                     highlights = {};
-                    currentPage = 1;
                     await goToPage(1);
+                    updateUIButtons();
                 } catch (err) {
                     alert('Error loading PDF: ' + err.message);
                 }
@@ -436,18 +467,39 @@
             reader.readAsArrayBuffer(file);
         }
 
-        // ─── Events ───
+        // ─── Buttons ───
         fileInput.addEventListener('change', e => {
             if (e.target.files.length > 0) loadPdf(e.target.files[0]);
         });
         prevBtn.addEventListener('click', () => goToPage(currentPage - 1));
         nextBtn.addEventListener('click', () => goToPage(currentPage + 1));
+        zoomInBtn.addEventListener('click', () => {
+            // Zoom in centered on current view
+            const cx = pageContainer.clientWidth / 2;
+            const cy = pageContainer.clientHeight / 2;
+            const contentCX = viewOffsetX + cx;
+            const contentCY = viewOffsetY + cy;
+            const newScale = viewScale + 0.25;
+            const newOffsetX = contentCX * (newScale / viewScale) - cx;
+            const newOffsetY = contentCY * (newScale / viewScale) - cy;
+            setView(newScale, newOffsetX, newOffsetY);
+        });
+        zoomOutBtn.addEventListener('click', () => {
+            const cx = pageContainer.clientWidth / 2;
+            const cy = pageContainer.clientHeight / 2;
+            const contentCX = viewOffsetX + cx;
+            const contentCY = viewOffsetY + cy;
+            const newScale = viewScale - 0.25;
+            const newOffsetX = contentCX * (newScale / viewScale) - cx;
+            const newOffsetY = contentCY * (newScale / viewScale) - cy;
+            setView(newScale, newOffsetX, newOffsetY);
+        });
         highlightBtn.addEventListener('click', addHighlightFromSelection);
         removeBtn.addEventListener('click', removeLastHighlight);
-        canvas.addEventListener('click', handleCanvasClick);
 
-        // Initial UI
-        updateUI();
+        // Initial
+        updateUIButtons();
+        zoomLevelSpan.textContent = '1.5';
     </script>
 </body>
-</html>
+    </html>
